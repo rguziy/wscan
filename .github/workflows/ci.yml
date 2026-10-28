@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet and test
+        run: make test
+      - name: Build all targets
+        run: make all
+      - name: Smoke test
+        run: |
+          dist/bin/wscan_linux_amd64 --version
+          dist/bin/wscan_linux_amd64 --demo --color never | head -n 20
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Smoke test
+        run: |
+          go build -o wscan.exe ./cmd/wscan
+          .\wscan.exe --version
+          .\wscan.exe --demo --color never
