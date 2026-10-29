@@ -75,13 +75,15 @@ func Scan(ctx context.Context, opt ScanOptions) (*Result, error) {
 		return nil, err
 	}
 
-	res := &Result{Interface: iface.Name, Time: time.Now()}
+	res := &Result{Interface: iface.Name, Time: time.Now(), Bands: wiphyBands(c, fam, iface.Wiphy)}
 	if opt.Fresh {
 		timeout := opt.Timeout
 		if timeout <= 0 {
 			timeout = defaultScanTimeout
 		}
-		fresh, note, err := triggerScan(ctx, c, fam, iface.Index, timeout)
+		fresh, note, err := withRetries(ctx, timeout, func(remaining time.Duration) (bool, string, bool, error) {
+			return triggerScan(ctx, c, fam, iface.Index, remaining)
+		}, sleepContext)
 		if err != nil {
 			return nil, err
 		}
@@ -110,6 +112,19 @@ func Scan(ctx context.Context, opt ScanOptions) (*Result, error) {
 	return res, nil
 }
 
+// wiphyBands asks the kernel which bands the adapter has. Any problem just
+// means "unknown": it is an extra, never a reason to fail the scan.
+func wiphyBands(c *genl.Conn, fam genl.Family, wiphy int) map[Band]BandSupport {
+	var b genl.Builder
+	b.Uint32(attrWiphy, uint32(wiphy))
+	b.Bytes(attrSplitWiphyDump, nil) // without it the kernel hides newer bands (6 GHz)
+	msgs, err := c.Execute(fam.ID, genl.Message{Command: cmdGetWiphy, Version: 1, Data: b.Data()}, genl.FlagDump)
+	if err != nil {
+		return nil
+	}
+	return parseWiphyBands(msgs, wiphy)
+}
+
 func scanRequest(cmd byte, ifindex int) genl.Message {
 	var b genl.Builder
 	b.Uint32(attrIfIndex, uint32(ifindex))
@@ -118,23 +133,25 @@ func scanRequest(cmd byte, ifindex int) genl.Message {
 
 // triggerScan starts an active scan and waits for the kernel to announce the
 // results. Problems that merely mean "no fresh data" (no permission, device
-// busy) are reported through note, not as errors.
-func triggerScan(ctx context.Context, c *genl.Conn, fam genl.Family, ifindex int, timeout time.Duration) (fresh bool, note string, err error) {
+// busy) are reported through note, not as errors. aborted is true when the
+// kernel cancelled the scan (another program started its own, or the adapter
+// had to leave the channel); such a scan is worth repeating.
+func triggerScan(ctx context.Context, c *genl.Conn, fam genl.Family, ifindex int, timeout time.Duration) (fresh bool, note string, aborted bool, err error) {
 	// Subscribe before triggering so the completion event cannot be missed.
 	events, err := genl.Dial()
 	if err != nil {
-		return false, "", err
+		return false, "", false, err
 	}
 	defer events.Close()
 	if id, ok := fam.Groups["scan"]; ok {
 		if err := events.JoinGroup(id); err != nil {
-			return false, "could not listen for scan events; showing cached results", nil
+			return false, "could not listen for scan events; showing cached results", false, nil
 		}
 	} else {
-		return false, "kernel offers no scan event group; showing cached results", nil
+		return false, "kernel offers no scan event group; showing cached results", false, nil
 	}
 	if err := events.SetReadTimeout(250 * time.Millisecond); err != nil {
-		return false, "", err
+		return false, "", false, err
 	}
 
 	var b genl.Builder
@@ -147,28 +164,28 @@ func triggerScan(ctx context.Context, c *genl.Conn, fam genl.Family, ifindex int
 	if _, err := c.Execute(fam.ID, req, genl.FlagAck); err != nil {
 		switch {
 		case errors.Is(err, syscall.EPERM), errors.Is(err, syscall.EACCES):
-			return false, "a fresh scan needs root or CAP_NET_ADMIN; showing cached results", nil
+			return false, "a fresh scan needs root or CAP_NET_ADMIN; showing cached results", false, nil
 		case errors.Is(err, syscall.EBUSY):
 			// A scan is already running (NetworkManager, wpa_supplicant);
 			// wait for it and use its results.
 		case errors.Is(err, syscall.ENETDOWN), errors.Is(err, syscall.ERFKILL):
-			return false, "the Wi-Fi interface is down or blocked; showing cached results", nil
+			return false, "the Wi-Fi interface is down or blocked; showing cached results", false, nil
 		default:
-			return false, fmt.Sprintf("could not start a scan (%v); showing cached results", err), nil
+			return false, fmt.Sprintf("could not start a scan (%v); showing cached results", err), false, nil
 		}
 	}
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
-			return false, "", err
+			return false, "", false, err
 		}
 		msgs, err := events.Receive()
 		if errors.Is(err, genl.ErrTimeout) {
 			continue
 		}
 		if err != nil {
-			return false, "", err
+			return false, "", false, err
 		}
 		for _, m := range msgs {
 			if m.Command != cmdNewScanResults && m.Command != cmdScanAborted {
@@ -178,12 +195,12 @@ func triggerScan(ctx context.Context, c *genl.Conn, fam genl.Family, ifindex int
 				continue
 			}
 			if m.Command == cmdScanAborted {
-				return false, "the scan was aborted; showing cached results", nil
+				return false, "the scan was aborted; showing cached results", true, nil
 			}
-			return true, "", nil
+			return true, "", false, nil
 		}
 	}
-	return false, "timed out waiting for the scan to finish; showing cached results", nil
+	return false, "timed out waiting for the scan to finish; showing cached results", false, nil
 }
 
 func eventForInterface(m genl.Message, ifindex int) bool {

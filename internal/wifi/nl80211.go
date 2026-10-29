@@ -12,6 +12,7 @@ import (
 const (
 	nl80211Family = "nl80211"
 
+	cmdGetWiphy       = 1
 	cmdGetInterface   = 5
 	cmdGetScan        = 32
 	cmdTriggerScan    = 33
@@ -25,6 +26,14 @@ const (
 	attrMAC       = 6
 	attrBSS       = 47
 	attrScanSSIDs = 45
+
+	attrWiphyBands     = 22
+	attrSplitWiphyDump = 174
+
+	// NL80211_BAND_ATTR_FREQS and NL80211_FREQUENCY_ATTR_*.
+	bandAttrFreqs    = 1
+	freqAttrFreq     = 1
+	freqAttrDisabled = 2
 
 	ifTypeStation = 2
 
@@ -129,6 +138,10 @@ func parseInterface(m genl.Message) (iface Interface, ok bool) {
 			if len(a.Data) == 6 {
 				iface.MAC = formatMAC(a.Data)
 			}
+		case attrWiphy:
+			if v, k := a.Uint32(); k {
+				iface.Wiphy = int(v)
+			}
 		}
 	}
 	iface.Type = interfaceTypeName(typ)
@@ -183,4 +196,76 @@ func pickInterface(ifaces []Interface, name string) (Interface, error) {
 		}
 	}
 	return ifaces[0], nil
+}
+
+// parseWiphyBands works out which bands the adapter (wiphy) can use from the
+// replies to a split GET_WIPHY dump. The bands are spread over several
+// messages, so the replies are merged. It returns nil when the replies carry
+// no band information at all, meaning "unknown".
+func parseWiphyBands(msgs []genl.Message, wiphy int) map[Band]BandSupport {
+	present := map[Band]bool{}
+	usable := map[Band]bool{}
+	for _, m := range msgs {
+		attrs, _ := genl.ParseAttrs(m.Data)
+		var id int = -1
+		var bands []genl.Attr
+		for _, a := range attrs {
+			switch a.Type {
+			case attrWiphy:
+				if v, ok := a.Uint32(); ok {
+					id = int(v)
+				}
+			case attrWiphyBands:
+				bands, _ = a.Nested()
+			}
+		}
+		if id != wiphy {
+			continue
+		}
+		for _, band := range bands {
+			fields, _ := band.Nested()
+			for _, f := range fields {
+				if f.Type != bandAttrFreqs {
+					continue
+				}
+				freqs, _ := f.Nested()
+				for _, fr := range freqs {
+					entry, _ := fr.Nested()
+					var mhz int
+					disabled := false
+					for _, e := range entry {
+						switch e.Type {
+						case freqAttrFreq:
+							if v, ok := e.Uint32(); ok {
+								mhz = int(v)
+							}
+						case freqAttrDisabled:
+							disabled = true
+						}
+					}
+					if b := BandOf(mhz); b != BandUnknown {
+						present[b] = true
+						if !disabled {
+							usable[b] = true
+						}
+					}
+				}
+			}
+		}
+	}
+	if len(present) == 0 {
+		return nil
+	}
+	out := map[Band]BandSupport{}
+	for _, b := range Bands() {
+		switch {
+		case usable[b]:
+			out[b] = SupportOK
+		case present[b]:
+			out[b] = SupportDisabled
+		default:
+			out[b] = SupportNone
+		}
+	}
+	return out
 }

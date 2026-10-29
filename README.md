@@ -23,6 +23,7 @@ itself. The result is a single static binary.
 - [Installation](#-installation)
 - [Quick start](#-quick-start)
 - [Flags](#-flags)
+- [Channel recommendations](#-channel-recommendations)
 - [What is shown](#-what-is-shown)
 - [Permissions](#-permissions)
 - [JSON output](#-json-output)
@@ -37,7 +38,10 @@ itself. The result is a single static binary.
    family; on Windows it opens a WLAN API handle.
 2. It picks a Wi-Fi interface (the first station interface, or `--interface`).
 3. Unless `--cached` is given, it asks the system for a fresh active scan and
-   waits for the completion event.
+   waits for the completion event. On Linux a scan that the kernel aborts
+   (usually because NetworkManager or `wpa_supplicant` started its own) is
+   repeated up to three times with a growing pause before falling back to the
+   cached results.
 4. It reads the scan table and decodes every beacon / probe response: HT, VHT,
    HE and EHT capabilities and operation elements, RSN / WPA, country, BSS
    load, roaming (802.11k/v/r), BSS colour and the beacon timestamp (AP uptime).
@@ -53,7 +57,7 @@ Download the zip for your platform from the
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-unzip wscan_1.0.0_linux_amd64.zip
+unzip wscan_1.1.0_linux_amd64.zip
 sudo install -m 0755 wscan /usr/local/bin/
 ```
 
@@ -79,6 +83,7 @@ sudo wscan -b 5,6          # only 5 and 6 GHz
 sudo wscan -w              # live view, rescans every 5 seconds
 wscan --cached             # no root: show what the kernel already knows
 wscan --demo               # made-up networks, no Wi-Fi hardware needed
+sudo wscan -r              # which channels should my router use?
 ```
 
 On Windows run it from Windows Terminal, PowerShell or `cmd` (no administrator
@@ -102,6 +107,13 @@ rights needed):
 | `--timeout DUR` | How long to wait for a fresh scan (default `15s`) |
 | `--json` | Print JSON instead of tables |
 | `--color MODE` | `auto` (default), `always` or `never` |
+| `-r`, `--recommend` | Recommend the least loaded channels for each band, see [below](#-channel-recommendations) |
+| `--scans N` | Scans to average in `--recommend` mode (default `3`, max `20`) |
+| `--scan-interval DUR` | Pause between those scans (default `2s`) |
+| `--ignore LIST` | SSIDs or BSSIDs to leave out of `--recommend`; repeatable and comma separated |
+| `--include-connected` | Do not ignore the connected network in `--recommend` |
+| `--country CC` | Two letter country code selecting the allowed channels |
+| `--width MHZ` | Channel width to recommend on 5 and 6 GHz: `20`, `40`, `80` (default), `160`, `320` |
 | `--list-interfaces` | List the Wi-Fi interfaces and exit |
 | `--demo` | Show made-up networks (no Wi-Fi hardware needed) |
 | `-V`, `--version` | Print the version and exit |
@@ -109,6 +121,74 @@ rights needed):
 
 Colours follow the [`NO_COLOR`](https://no-color.org) convention and are
 switched off automatically when the output is not a terminal.
+
+## 🎯 Channel recommendations
+
+Flaky Wi-Fi is very often a crowded channel. `wscan --recommend` scans several
+times, averages the results and ranks the channels of every band by how little
+they overlap with the networks around you, so you can set the best ones in your
+router.
+
+```sh
+sudo wscan -r                          # 3 scans, 80 MHz on 5 and 6 GHz
+sudo wscan -r --scans 5 --width 40     # more scans, narrower channels
+sudo wscan -r --ignore "MyWiFi-Guest,MyWiFi-IoT"
+sudo wscan -r -b 5 --json              # machine readable
+```
+
+Every candidate shows the **channel to enter in the router together with its
+frequency and the spectrum it occupies**, for example channel `149` is
+`5745 MHz` and an 80 MHz channel on it spans `5735–5815 MHz`, so there is no
+need to look up which frequency a channel number stands for:
+
+```
+  ── 5 GHz ─ 80 MHz · 3 networks ──────────────────────────────────────────
+  #     CH  FREQUENCY   WIDTH           SPAN  LOAD               SCORE
+  1    149   5745 MHz  80 MHz  5735–5815 MHz  ░░░░░░░░░░  clear   0.00
+  2    116   5580 MHz  80 MHz  5570–5650 MHz  ░░░░░░░░░░  clear   0.00  DFS
+  3     52   5260 MHz  80 MHz  5250–5330 MHz  ▌░░░░░░░░░  clear   0.07  DFS
+  now   36   5180 MHz  80 MHz  5170–5250 MHz  █▌░░░░░░░░  light   0.50
+```
+
+The `now` row is where your connected network sits at the moment, scored the
+same way, so you can see what changing the channel would buy you.
+
+**Your own router is left out.** Your own networks would otherwise count as
+interference. The SSID of the network you are connected to is ignored
+automatically (all its bands), and `--ignore` takes a list of further SSIDs or
+BSSIDs, because a router often broadcasts several networks (guest, IoT). When
+other networks share the connected router's hardware address, `wscan` points
+them out so you can add them. Use `--include-connected` to count everything.
+
+**Country.** The channels a router may use depend on the country. By default
+the country announced by the connected network is used, otherwise the most
+common one among the networks around; `--country UA` sets it explicitly.
+
+**How the score works.** For every candidate channel (a block of channels at
+the chosen width) `wscan` adds up the networks whose spectrum overlaps it. Each
+one counts more the stronger its signal is (nothing below about -95 dBm, full
+weight from -40 dBm), more if it advertises a busy channel, and less if it was
+only seen in some of the scans. A score of 0 means empty; one strong network on
+the same channel is about 0.7. The levels are `clear` (below 0.15), `light`,
+`moderate` and `heavy` (above 1.5).
+
+| Band | What is recommended |
+| --- | --- |
+| 2.4 GHz | Channels 1, 6 and 11 at 20 MHz, the only ones that do not overlap |
+| 5 GHz | Blocks of the chosen width. Channels 52–144 are marked **DFS**: they must yield to radar, so the router may leave them without warning; on a tie a non-DFS channel is preferred |
+| 6 GHz | Blocks of the chosen width; Europe has the lower 6 GHz only (5945–6425 MHz) |
+
+**Bands your adapter cannot scan.** On Linux `wscan` asks the kernel which bands
+the adapter has. A band the hardware lacks is reported as such, and a band that
+is present but switched off by the regulatory domain says so and suggests
+setting the country (for example `sudo iw reg set UA`), instead of ranking
+channels from no data. On Windows the adapter's bands are not reported, so an
+empty band is ranked with a note that it is empty or not scannable.
+
+This is a heuristic, not a guarantee. A single scan is a snapshot, so use
+several; the regulatory tables are simplified (European rules, US-like and
+Japan) and your router only offers the channels its firmware allows, so when a
+recommended channel is missing in its settings take the next one.
 
 ## 🎨 What is shown
 
@@ -198,7 +278,7 @@ make build        # host binary in dist/wscan
 make test         # go vet and go test
 make demo         # build and run with made-up networks
 make all          # cross-compile all targets, zip archives and SHA256SUMS
-make VERSION=1.0.1 linux-arm64
+make VERSION=1.1.1 linux-arm64
 ```
 
 All builds are static (`CGO_ENABLED=0`). The project has no third-party

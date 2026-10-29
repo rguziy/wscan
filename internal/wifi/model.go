@@ -102,8 +102,22 @@ func (a AP) WiFiLabel() string {
 	return ""
 }
 
+// BandSupport says whether an adapter can use a band.
+type BandSupport string
+
+// Band support values. The empty value means the platform cannot tell.
+const (
+	SupportUnknown  BandSupport = ""
+	SupportNone     BandSupport = "none"     // the hardware has no such band
+	SupportDisabled BandSupport = "disabled" // present, but off in the regulatory domain
+	SupportOK       BandSupport = "ok"
+)
+
 // Interface is a wireless network interface.
 type Interface struct {
+	// Wiphy is the Linux wireless device the interface belongs to; zero on
+	// other platforms.
+	Wiphy int    `json:"-"`
 	Index int    `json:"index"`
 	Name  string `json:"name"`
 	Type  string `json:"type"`
@@ -120,6 +134,9 @@ type Result struct {
 	// Notes holds non-fatal warnings to show to the user.
 	Notes []string
 	APs   []AP
+	// Bands says which bands the adapter supports; nil when the platform
+	// cannot tell (Windows).
+	Bands map[Band]BandSupport
 }
 
 // ScanOptions controls a scan.

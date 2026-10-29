@@ -129,3 +129,25 @@ func fitSegs(segs []seg, width int) []seg {
 	}
 	return append(out, seg{"…", last})
 }
+
+// wrapWords breaks text into lines of at most width cells at spaces. A single
+// word longer than width stays whole on its own line.
+func wrapWords(text string, width int) []string {
+	var lines []string
+	cur := ""
+	for _, word := range strings.Fields(text) {
+		switch {
+		case cur == "":
+			cur = word
+		case textWidth(cur)+1+textWidth(word) <= width:
+			cur += " " + word
+		default:
+			lines = append(lines, cur)
+			cur = word
+		}
+	}
+	if cur != "" {
+		lines = append(lines, cur)
+	}
+	return lines
+}

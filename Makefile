@@ -6,13 +6,13 @@
 #   make linux-armv7     build a single target (see "make list")
 #   make test            run vet and the test suite
 #   make demo            run the host build with made-up networks (no Wi-Fi needed)
-#   make VERSION=1.0.1   override the version embedded into the binary
+#   make VERSION=1.1.1   override the version embedded into the binary
 #
 # All builds are static, pure Go (CGO_ENABLED=0). Archives are created with
 # the "zip" tool, which must be installed.
 
 MODULE  := github.com/rguziy/wscan
-VERSION ?= 1.0.0
+VERSION ?= 1.1.0
 DIST    := dist
 LDFLAGS := -s -w -X $(MODULE)/internal/version.Version=$(VERSION)
 

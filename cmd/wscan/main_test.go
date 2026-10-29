@@ -41,3 +41,47 @@ func TestParseBands(t *testing.T) {
 		}
 	}
 }
+
+func TestStringList(t *testing.T) {
+	var l stringList
+	for _, v := range []string{"Home, Home-IoT", "", "AA:BB:CC:DD:EE:FF"} {
+		if err := l.Set(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"Home", "Home-IoT", "AA:BB:CC:DD:EE:FF"}
+	if len(l) != len(want) {
+		t.Fatalf("got %q, want %q", l, want)
+	}
+	for i := range want {
+		if l[i] != want[i] {
+			t.Errorf("item %d = %q, want %q", i, l[i], want[i])
+		}
+	}
+}
+
+func TestValidateRecommend(t *testing.T) {
+	ok := func(c config) config { c.scans, c.width = 3, 80; return c }
+	cases := []struct {
+		name string
+		cfg  config
+		bad  bool
+	}{
+		{"plain scan needs nothing", config{}, false},
+		{"ignore without recommend", config{ignore: stringList{"x"}}, true},
+		{"country without recommend", config{country: "UA"}, true},
+		{"include-connected without recommend", config{includeConnected: true}, true},
+		{"valid", ok(config{recommend: true, country: "UA"}), false},
+		{"with watch", ok(config{recommend: true, watch: true}), true},
+		{"too many scans", func() config { c := ok(config{recommend: true}); c.scans = 99; return c }(), true},
+		{"zero scans", func() config { c := ok(config{recommend: true}); c.scans = 0; return c }(), true},
+		{"bad width", func() config { c := ok(config{recommend: true}); c.width = 100; return c }(), true},
+		{"bad country", ok(config{recommend: true, country: "UKR"}), true},
+	}
+	for _, c := range cases {
+		cfg := c.cfg
+		if err := validateRecommend(&cfg); (err != nil) != c.bad {
+			t.Errorf("%s: error = %v, want error %v", c.name, err, c.bad)
+		}
+	}
+}

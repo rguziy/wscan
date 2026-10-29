@@ -39,6 +39,15 @@ Flags:
       --timeout DUR      How long to wait for a fresh scan (default 15s)
       --json             Print JSON instead of tables
       --color MODE       Colour output: auto (default), always or never
+  -r, --recommend        Recommend the least loaded channels for each band
+      --scans N          Scans to average in --recommend mode (default 3)
+      --scan-interval D  Pause between those scans (default 2s)
+      --ignore LIST      SSIDs or BSSIDs to leave out of --recommend (repeatable,
+                         comma separated); the connected network is always ignored
+      --include-connected  Do not ignore the connected network in --recommend
+      --country CC       Country for the allowed channels (default: the connected
+                         network's country, else the most common one around)
+      --width MHZ        Channel width to recommend on 5 and 6 GHz (default 80)
       --list-interfaces  List the Wi-Fi interfaces and exit
       --demo             Show made-up networks (no Wi-Fi hardware needed)
   -V, --version          Print the version and exit
@@ -62,6 +71,28 @@ type config struct {
 	listIfaces bool
 	demo       bool
 	showVer    bool
+
+	recommend        bool
+	scans            int
+	scanInterval     time.Duration
+	ignore           stringList
+	includeConnected bool
+	country          string
+	width            int
+}
+
+// stringList is a repeatable flag whose values may also be comma separated.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			*l = append(*l, item)
+		}
+	}
+	return nil
 }
 
 func main() {
@@ -100,6 +131,13 @@ func run(args []string, stdout, stderr *os.File) int {
 	boolean(&cfg.listIfaces, "", "list-interfaces")
 	boolean(&cfg.demo, "", "demo")
 	boolean(&cfg.showVer, "V", "version")
+	boolean(&cfg.recommend, "r", "recommend")
+	boolean(&cfg.includeConnected, "", "include-connected")
+	fs.Var(&cfg.ignore, "ignore", "")
+	fs.IntVar(&cfg.scans, "scans", 3, "")
+	fs.DurationVar(&cfg.scanInterval, "scan-interval", 2*time.Second, "")
+	fs.StringVar(&cfg.country, "country", "", "")
+	fs.IntVar(&cfg.width, "width", 80, "")
 	fs.DurationVar(&cfg.interval, "interval", 5*time.Second, "")
 	fs.DurationVar(&cfg.timeout, "timeout", 15*time.Second, "")
 	fs.StringVar(&cfg.color, "color", "auto", "")
@@ -149,6 +187,11 @@ func run(args []string, stdout, stderr *os.File) int {
 		return exitUsage
 	}
 
+	if err := validateRecommend(&cfg); err != nil {
+		fmt.Fprintf(stderr, "wscan: %v\n", err)
+		return exitUsage
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -156,7 +199,7 @@ func run(args []string, stdout, stderr *os.File) int {
 		return listInterfaces(stdout, stderr, cfg.jsonOut)
 	}
 
-	a := &app{cfg: cfg, bands: bands, sortKey: sortKey, profile: profile, stdout: stdout}
+	a := &app{cfg: cfg, bands: bands, sortKey: sortKey, profile: profile, stdout: stdout, stderr: stderr}
 	if cfg.watch && !cfg.jsonOut && !render.IsTerminal(stdout) {
 		fmt.Fprintln(stderr, "wscan: --watch needs a terminal (or --json for a stream of JSON lines)")
 		return exitUsage
@@ -164,6 +207,8 @@ func run(args []string, stdout, stderr *os.File) int {
 
 	var runErr error
 	switch {
+	case cfg.recommend:
+		runErr = a.recommend(ctx)
 	case cfg.watch && cfg.jsonOut:
 		runErr = a.streamJSON(ctx)
 	case cfg.watch:
@@ -184,6 +229,7 @@ type app struct {
 	sortKey wifi.SortKey
 	profile render.Profile
 	stdout  *os.File
+	stderr  *os.File
 }
 
 func (a *app) scan(ctx context.Context) (*wifi.Result, error) {
@@ -351,4 +397,111 @@ func parseBands(s string) (map[wifi.Band]bool, error) {
 		}
 	}
 	return set, nil
+}
+
+// validateRecommend checks the flags that only matter with --recommend.
+func validateRecommend(cfg *config) error {
+	if !cfg.recommend {
+		for name, set := range map[string]bool{
+			"--ignore":            len(cfg.ignore) > 0,
+			"--include-connected": cfg.includeConnected,
+			"--country":           cfg.country != "",
+		} {
+			if set {
+				return fmt.Errorf("%s only makes sense together with --recommend", name)
+			}
+		}
+		return nil
+	}
+	if cfg.watch {
+		return errors.New("--recommend cannot be combined with --watch")
+	}
+	if cfg.scans < 1 || cfg.scans > 20 {
+		return errors.New("--scans must be between 1 and 20")
+	}
+	if cfg.scanInterval < 0 {
+		return errors.New("--scan-interval must not be negative")
+	}
+	switch cfg.width {
+	case 20, 40, 80, 160, 320:
+	default:
+		return errors.New("--width must be 20, 40, 80, 160 or 320")
+	}
+	if cfg.country != "" && len(cfg.country) != 2 {
+		return fmt.Errorf("--country must be a two letter code, got %q", cfg.country)
+	}
+	return nil
+}
+
+// recommend scans several times and prints channel recommendations.
+func (a *app) recommend(ctx context.Context) error {
+	showProgress := !a.cfg.jsonOut && render.IsTerminal(a.stderr)
+	var (
+		scans    [][]wifi.AP
+		first    *wifi.Result
+		notes    []string
+		allFresh = true
+	)
+	seenNote := map[string]bool{}
+	for i := 0; i < a.cfg.scans; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(a.cfg.scanInterval):
+			}
+		}
+		if showProgress {
+			fmt.Fprintf(a.stderr, "\r  Scanning %d/%d ...\x1b[K", i+1, a.cfg.scans)
+		}
+		res, err := a.scan(ctx)
+		if err != nil {
+			if showProgress {
+				fmt.Fprint(a.stderr, "\r\x1b[K")
+			}
+			return err
+		}
+		if first == nil {
+			first = res
+		}
+		allFresh = allFresh && res.Fresh
+		for _, n := range res.Notes {
+			if !seenNote[n] {
+				seenNote[n] = true
+				notes = append(notes, n)
+			}
+		}
+		scans = append(scans, res.APs)
+	}
+	if showProgress {
+		fmt.Fprint(a.stderr, "\r\x1b[K")
+	}
+	if !allFresh && a.cfg.scans > 1 {
+		notes = append(notes, "some scans were not fresh, so they may repeat the same cached data")
+	}
+
+	rec := wifi.Recommend(scans, wifi.RecommendOptions{
+		Ignore:           a.cfg.ignore,
+		IncludeConnected: a.cfg.includeConnected,
+		Country:          a.cfg.country,
+		Width:            a.cfg.width,
+		Adapter:          first.Bands,
+	})
+	rec.Interface = first.Interface
+	rec.Time = time.Now()
+	rec.Notes = append(notes, rec.Notes...)
+	if len(a.bands) > 0 {
+		var kept []wifi.BandRecommendation
+		for _, br := range rec.Bands {
+			if a.bands[br.Band] {
+				kept = append(kept, br)
+			}
+		}
+		rec.Bands = kept
+	}
+
+	if a.cfg.jsonOut {
+		return writeJSON(a.stdout, rec, true)
+	}
+	return render.RenderRecommendation(a.stdout, rec, a.renderOptions())
 }
